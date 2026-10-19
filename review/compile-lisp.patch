@@ -1,0 +1,506 @@
+From 60ba07509e5fc5981b162f4a293ce8d4b0288ed1 Mon Sep 17 00:00:00 2001
+From: pepopepopepo <311073437+pepopepopepo@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 06:22:37 +0000
+Subject: [PATCH] fix: byte-compile lisp/ in make packages, which runs in a
+ temporary HOME
+
+lisp/ (19 files) ran interpreted: scripts/build-packages.el compiled
+lib/ only, so whatever the byte compiler would have said about the own
+modules stayed unseen, and they loaded as source at each start (HANDOFF
+2, 10). The compiler now runs over lisp/ after lib/, with init.el's
+prelude in force (the generated load path and autoloads, use-package's
+settings, the platform defaults file; emacs-cpp-defaults-feature is read
+from init.el so the platform mapping keeps one source, D-055), because
+four modules expand use-package forms that need it; a warning is an
+error, as it is for the tests. Old .elc files are deleted first,
+lisp/*.elc is git-ignored, and init-packages-are-built-and-fresh covers
+them.
+
+Compiling a module runs its top-level requires, so sibling modules load
+and turn their modes on: recentf-mode and savehist-mode wrote
+~/.emacs.d/recentf.eld and ~/.emacs.d/history during the first build.
+make packages therefore runs in a temporary HOME like make test (D-104),
+through one shared helper; REAL_HOME=1 opts out of both.
+
+Everything the compiler reported was fixed in the modules, none of it a
+change of behaviour: 33 declarations (declare-function, defvar) of
+functions and variables a module uses before loading their package,
+docstrings wider than 80 columns rewrapped, and init-cmake.el's
+:load-path, which read a defconst of the same file at expansion time
+(eval-and-compile).
+
+Checked: make packages (33 packages, 216 lib files, 19 own files, exit
+0); make check ok; make test, 133 tests, the same 51 failures as before
+the change on a machine without the C++ grammar (D-008), with
+init-packages-are-built-and-fresh passing; the real ~/.emacs.d untouched
+by the build.
+
+Reasoning:
+What was wrong: the own modules were the one part of the tree the byte
+  compiler never saw; their warnings were unknown and their load cost
+  paid at every start.
+Evidence: the first compile over lisp/ reported 44 warnings in 15
+  modules (review C-10); four modules do not compile standalone
+  (use-package reads the defaults and autoloads at expansion).
+Ruled out: compiling lisp/ standalone (the four failures); native-
+  compiling lisp/ in the build (Emacs does it on load, into eln-cache);
+  silencing the warnings instead of fixing them (seeing them is the
+  point); the real HOME for the build (the two state files above).
+Tier: 2
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .gitignore                  |  1 +
+ CLAUDE.md                   |  3 +-
+ Makefile                    | 30 ++++++++++-----
+ README.md                   |  5 ++-
+ lisp/defaults-darwin.el     | 12 +++---
+ lisp/defaults-gnu-linux.el  |  3 +-
+ lisp/init-cells.el          |  7 ++++
+ lisp/init-cmake.el          | 15 +++++---
+ lisp/init-completion.el     | 18 +++++++--
+ lisp/init-cpp.el            |  7 ++++
+ lisp/init-debug.el          |  7 ++++
+ lisp/init-git.el            |  5 +++
+ lisp/init-go-to-anything.el | 28 +++++++-------
+ lisp/init-lsp.el            | 12 +++++-
+ lisp/init-project.el        | 12 +++++-
+ lisp/init-ui.el             |  7 ++++
+ scripts/build-packages.el   | 75 ++++++++++++++++++++++++++++++++++---
+ test/init-test.el           | 17 +++++----
+ 18 files changed, 207 insertions(+), 57 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index d6e25c0..dc2ca35 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -4,2 +4,3 @@
+ /lib/info/
++/lisp/*.elc
+ # Left by makepkg in packaging/clangd-index-nav (the package is built there).
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 424f9b1..8b77868 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -114,3 +114,4 @@
+   hand, Arch or the Mac (D-058). Docs-only commits skip it. Test in the profile you
+-  ship. `make test` runs in a temporary HOME; `REAL_HOME=1` uses the real one (D-104).
++  ship. `make packages` and `make test` run in a temporary HOME; `REAL_HOME=1` uses the
++  real one (D-104).
+ 
+diff --git a/Makefile b/Makefile
+index 128c099..e5665d8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -12,7 +12,5 @@
+ .PHONY: packages test
+-packages: ## byte-compile lib/ submodules; write lib/load-path.el, lib/autoloads.el
+-	$(EMACS) -Q --batch -l scripts/build-packages.el -f build-packages-batch
+-
+-# make test runs in an empty temporary HOME, so no test can write to the real one
+-# (D-104); REAL_HOME=1 runs in yours, as a hand run of the test files does.
++# make packages and make test run in an empty temporary HOME, so neither a module
++# the compiler loads (a file's `require's run at compile time) nor a test can write
++# to the real one (D-104); REAL_HOME=1 runs in yours, as a hand run does.
+ REAL_HOME ?=
+@@ -22,5 +20,20 @@
+ HOME_CHECK = --eval "(when (file-equal-p \"~\" (concat \"~\" (user-login-name))) \
+-	(error \"make test: HOME is the real home, %s; it should be a temporary directory (D-104)\" \
++	(error \"make: HOME is the real home, %s; it should be a temporary directory (D-104)\" \
+ 	(expand-file-name \"~\")))"
+ endif
++# $(call temp-home,NAME,COMMAND): COMMAND with HOME set to a fresh directory,
++# removed when it ends.
++temp-home = home=$$(mktemp -d "$${TMPDIR:-/tmp}/emacs-cpp-$(1)-home.XXXXXX") || exit 1; \
++	trap 'rm -rf "$$home"' EXIT; trap 'exit 130' INT TERM; \
++	echo "make $(1): HOME=$$home"; \
++	HOME="$$home" $(2)
++
++BUILD = $(EMACS) -Q --batch $(HOME_CHECK) -l scripts/build-packages.el -f build-packages-batch
++
++packages: ## byte-compile lib/ and lisp/ in a temporary HOME; write lib/load-path.el, lib/autoloads.el
++ifeq ($(REAL_HOME),)
++	@$(call temp-home,packages,$(BUILD))
++else
++	$(BUILD)
++endif
+ ERT = $(EMACS) -Q --batch $(HOME_CHECK) -L scripts -L lisp -L test \
+@@ -32,6 +45,3 @@
+ ifeq ($(REAL_HOME),)
+-	@home=$$(mktemp -d "$${TMPDIR:-/tmp}/emacs-cpp-test-home.XXXXXX") || exit 1; \
+-	trap 'rm -rf "$$home"' EXIT; trap 'exit 130' INT TERM; \
+-	echo "make test: HOME=$$home"; \
+-	HOME="$$home" $(ERT)
++	@$(call temp-home,test,$(ERT))
+ else
+diff --git a/README.md b/README.md
+index f232707..09c538a 100644
+--- a/README.md
++++ b/README.md
+@@ -44,3 +44,3 @@
+ cd ~/source/repos/emacs-cpp
+-make packages    # byte-compile lib/, write lib/load-path.el, lib/autoloads.el, lib/info/
++make packages    # byte-compile lib/ and lisp/; write lib/load-path.el, autoloads.el, info/
+ make test        # optional: the ERT suite, in a temporary HOME (REAL_HOME=1: yours)
+@@ -208,2 +208,4 @@
+ stops with git's message when a patch no longer fits the new pin.
++Like `make test`, it runs in a temporary HOME (D-104): compiling a module loads the
++modules it requires, and a loaded module turns its modes on.
+ 
+@@ -294,2 +296,3 @@
+ | `lib/info/` | package manuals, generated by `make packages`, git-ignored |
++| `lisp/*.elc` | the own modules compiled by `make packages`, git-ignored |
+ 
+diff --git a/lisp/defaults-darwin.el b/lisp/defaults-darwin.el
+index 71794f1..5c10e18 100644
+--- a/lisp/defaults-darwin.el
++++ b/lisp/defaults-darwin.el
+@@ -16,7 +16,9 @@
+   '("/opt/local/bin" "/opt/local/sbin" "/usr/local/bin" "/Library/TeX/texbin")
+-  "Directories put in front of `exec-path' and PATH at startup when missing (D-089).
+-Emacs started from the Dock or Finder gets launchd's PATH, /usr/bin:/bin:/usr/sbin:
+-/sbin, whatever Emacs.app's Info.plist asks for: then rg, cmake, ninja, pyright
+-(MacPorts, D-053), R (CRAN's, in /usr/local/bin) and TeX (MacTeX: pdflatex,
+-latexmk, dvipng for AUCTeX's preview and texlab's build, D-090) were not found.
++  "Directories put in front of `exec-path' and PATH at startup when missing
++\(D-089).
++Emacs started from the Dock or Finder gets launchd's PATH,
++/usr/bin:/bin:/usr/sbin:/sbin, whatever Emacs.app's Info.plist asks for: then
++rg, cmake, ninja, pyright (MacPorts, D-053), R (CRAN's, in /usr/local/bin) and
++TeX (MacTeX: pdflatex, latexmk, dvipng for AUCTeX's preview and texlab's build,
++D-090) were not found.
+ Shells get /Library/TeX/texbin from /etc/paths.d, which launchd does not read.")
+diff --git a/lisp/defaults-gnu-linux.el b/lisp/defaults-gnu-linux.el
+index 3c47901..a1abb2b 100644
+--- a/lisp/defaults-gnu-linux.el
++++ b/lisp/defaults-gnu-linux.el
+@@ -14,3 +14,4 @@
+ (defconst emacs-cpp-default-exec-path-prepend nil
+-  "Directories put in front of `exec-path' and PATH at startup when missing (D-089).
++  "Directories put in front of `exec-path' and PATH at startup when missing
++\(D-089).
+ None on Arch: pacman installs into /usr/bin.")
+diff --git a/lisp/init-cells.el b/lisp/init-cells.el
+index b1ed91f..2d5690c 100644
+--- a/lisp/init-cells.el
++++ b/lisp/init-cells.el
+@@ -13,2 +13,9 @@
+ 
++;; For the byte compiler (`make packages' counts a warning as an error): variables and
++;; functions of packages this module uses before loading them.
++(defvar python-shell--first-prompt-received)
++(declare-function python-shell-get-process "python")
++(declare-function python-shell-send-region "python")
++(declare-function ess-eval-region "ess-inf")
++
+ (defun emacs-cpp-cells--python-eval (start end)
+diff --git a/lisp/init-cmake.el b/lisp/init-cmake.el
+index a7abe34..2cda7f3 100644
+--- a/lisp/init-cmake.el
++++ b/lisp/init-cmake.el
+@@ -13,8 +13,11 @@
+ 
+-(defconst emacs-cpp-cmake-mode-directory
+-  (pcase system-type
+-    ('gnu/linux "/usr/share/emacs/site-lisp")
+-    ('darwin "/opt/local/share/emacs/site-lisp")
+-    (_ (error "emacs-cpp: no cmake-mode directory known for %s (D-050)" system-type)))
+-  "Where the system cmake package installs cmake-mode.el (D-013, D-053).")
++;; `eval-and-compile': use-package's `:load-path' below reads the value while the form
++;; expands, so the byte compiler needs it too (`make packages').
++(eval-and-compile
++  (defconst emacs-cpp-cmake-mode-directory
++    (pcase system-type
++      ('gnu/linux "/usr/share/emacs/site-lisp")
++      ('darwin "/opt/local/share/emacs/site-lisp")
++      (_ (error "emacs-cpp: no cmake-mode directory known for %s (D-050)" system-type)))
++    "Where the system cmake package installs cmake-mode.el (D-013, D-053)."))
+ 
+diff --git a/lisp/init-completion.el b/lisp/init-completion.el
+index 667b752..8a240da 100644
+--- a/lisp/init-completion.el
++++ b/lisp/init-completion.el
+@@ -25,2 +25,12 @@
+ 
++;; For the byte compiler (`make packages' counts a warning as an error): variables and
++;; functions of packages this module uses before loading them.
++(defvar vertico--metadata)
++(defvar vertico-sort-function)
++(defvar xref-show-xrefs-function)
++(defvar xref-show-definitions-function)
++(declare-function yas-maybe-expand-abbrev-key-filter "yasnippet")
++(declare-function yas-expand "yasnippet")
++(declare-function yas-insert-snippet "yasnippet")
++
+ ;;;; Match tiers (D-120)
+@@ -48,6 +58,6 @@
+ (defun emacs-cpp--match-word-start (char &optional next)
+-  "Return a case-sensitive regexp for CHAR at a word start, NEXT the class after it.
+-After the start or a character that is no letter or digit; as a capital after a
+-small letter or digit; as a capital ending a run of capitals before a small letter
+-\(then NEXT, lower case, or any small letter, is matched too)."
++  "Return a case-sensitive regexp for CHAR at a word start; NEXT follows it.
++After the start or a character that is no letter or digit; as a capital after
++a small letter or digit; as a capital ending a run of capitals before a small
++letter (then NEXT, lower case, or any small letter, is matched too)."
+   (let ((any (emacs-cpp--match-class char))
+diff --git a/lisp/init-cpp.el b/lisp/init-cpp.el
+index 088c9d7..d4d5d4a 100644
+--- a/lisp/init-cpp.el
++++ b/lisp/init-cpp.el
+@@ -12,2 +12,9 @@
+ 
++;; For the byte compiler (`make packages' counts a warning as an error): variables and
++;; functions of packages this module uses before loading them.
++(defvar c-ts-indent-offset)
++(defvar c-ts-mode-indent-style)
++(declare-function c-ts-mode-set-style "c-ts-mode")
++(declare-function treesit-simple-indent-add-rules "treesit")
++
+ (require 'emacs-cpp-presets)
+diff --git a/lisp/init-debug.el b/lisp/init-debug.el
+index 71af6bd..9fa5d71 100644
+--- a/lisp/init-debug.el
++++ b/lisp/init-debug.el
+@@ -29,2 +29,9 @@
+ 
++;; For the byte compiler (`make packages' counts a warning as an error): variables and
++;; functions of packages this module uses before loading them.
++(defvar dape-configs)
++(defvar dape-command)
++(defvar dape-history)
++(declare-function dape-cwd "dape")
++
+ (require 'emacs-cpp-presets)
+diff --git a/lisp/init-git.el b/lisp/init-git.el
+index 67aeabc..0e4e9af 100644
+--- a/lisp/init-git.el
++++ b/lisp/init-git.el
+@@ -8,2 +8,7 @@
+ 
++;; For the byte compiler (`make packages' counts a warning as an error): variables and
++;; functions of packages this module uses before loading them.
++(declare-function diff-hl-magit-pre-refresh "diff-hl")
++(declare-function diff-hl-magit-post-refresh "diff-hl")
++
+ (use-package magit)
+diff --git a/lisp/init-go-to-anything.el b/lisp/init-go-to-anything.el
+index 8022166..09de8a4 100644
+--- a/lisp/init-go-to-anything.el
++++ b/lisp/init-go-to-anything.el
+@@ -119,7 +119,8 @@
+ asks for \"\" when its prompt opens, which lists clangd's first 100 symbols;
+-`< l' does so when narrowed to (D-086), hidden it gets no input.  A reply to an input
+-that has since changed is dropped.  With ROOT-URIS, each request asks for up to
+-`emacs-cpp-go-symbol-limit' matches (D-083) and only symbols under one of
+-ROOT-URIS are kept (D-082): within clangd's usual 100, library symbols crowd the
+-project's out.  Symbols keep the order each server sent them in (D-105)."
++`< l' does so when narrowed to (D-086), hidden it gets no input.  A reply to
++an input that has since changed is dropped.  With ROOT-URIS, each request asks
++for up to `emacs-cpp-go-symbol-limit' matches (D-083) and only symbols under
++one of ROOT-URIS are kept (D-082): within clangd's usual 100, library symbols
++crowd the project's out.  Symbols keep the order each server sent them in
++\(D-105)."
+   (lambda (sink)
+@@ -181,7 +182,8 @@
+ Each server gets its own sources under its own heading, such as Project Symbol
+-\(clangd), so the servers' symbols never mix (D-106); the narrow keys are shared.
+-`s': symbols defined under ROOT (D-082), as Project Symbol (D-118).  `l', hidden until narrowed: every
+-symbol of the server's index, deal.II's and the standard library's too, clangd's
+-best 100 as `C-c l s' shows them, its first 100 for an empty input (D-086).
+-Without ROOT, `s' is the latter, as Symbol, but asks nothing for an empty input."
++\(clangd), so the servers' symbols never mix (D-106); the narrow keys are
++shared.  `s': symbols defined under ROOT (D-082), as Project Symbol (D-118).
++`l', hidden until narrowed: every symbol of the server's index, deal.II's and
++the standard library's too, clangd's best 100 as `C-c l s' shows them, its
++first 100 for an empty input (D-086).  Without ROOT, `s' is the latter, as
++Symbol, but asks nothing for an empty input."
+   (when (featurep 'eglot)
+@@ -275,5 +277,5 @@
+ letter and SPC; `<' first does not filter the files by the letter (D-079).
+-`< <' widens again.  Symbols need three characters and a running eglot server.  Case
+-is ignored (D-105).  The settings of D-077 hold only while the prompt is open; the
+-command or project chosen runs after it, with the usual ones."
++`< <' widens again.  Symbols need three characters and a running eglot server.
++Case is ignored (D-105).  The settings of D-077 hold only while the prompt is
++open; the command or project chosen runs after it, with the usual ones."
+   (interactive)
+diff --git a/lisp/init-lsp.el b/lisp/init-lsp.el
+index 091474d..856cc6b 100644
+--- a/lisp/init-lsp.el
++++ b/lisp/init-lsp.el
+@@ -13,5 +13,13 @@
+ 
++;; For the byte compiler (`make packages' counts a warning as an error): variables and
++;; functions of packages this module uses before loading them.
++(defvar eglot-server-programs)
++(declare-function emacs-cpp-eglot-watch-enable "emacs-cpp-eglot-watch")
++(declare-function eglot--capabilities "eglot")
++(declare-function eglot--server-info "eglot")
++
+ (defun emacs-cpp-lsp-server (modes contact)
+-  "Make eglot start CONTACT for buffers in MODES, ahead of its own entries (D-091).
+-MODES and CONTACT as in `eglot-server-programs'; the latest call wins for a mode."
++  "Make eglot start CONTACT for MODES' buffers, ahead of its own entries (D-091).
++MODES and CONTACT as in `eglot-server-programs'; the latest call wins for a
++mode."
+   (with-eval-after-load 'eglot
+diff --git a/lisp/init-project.el b/lisp/init-project.el
+index 46e68e7..de17b62 100644
+--- a/lisp/init-project.el
++++ b/lisp/init-project.el
+@@ -11,2 +11,9 @@
+ 
++;; For the byte compiler (`make packages' counts a warning as an error): variables and
++;; functions of packages this module uses before loading them.
++(declare-function projectile-update-project-type "projectile")
++(declare-function projectile-root-local "projectile")
++(declare-function projectile-root-bottom-up "projectile")
++(declare-function treemacs-follow-mode "treemacs")
++
+ (require 'emacs-cpp-presets)
+@@ -14,3 +21,3 @@
+ (defun emacs-cpp-search-program-check (program)
+-  "Return PROGRAM, a key of `xref-search-program-alist', when its executable is found.
++  "Return PROGRAM, a key of `xref-search-program-alist', if its executable exists.
+ Signal an error naming the executable otherwise (D-081)."
+@@ -52,3 +59,4 @@
+   "Non-nil: the tree expands to and marks the selected buffer's file, as
+-treemacs does by default.  nil (the default): it stays where you left it (D-067)."
++treemacs does by default.  nil (the default): it stays where you left it
++\(D-067)."
+   :type 'boolean
+diff --git a/lisp/init-ui.el b/lisp/init-ui.el
+index 98cd44d..3ebbf63 100644
+--- a/lisp/init-ui.el
++++ b/lisp/init-ui.el
+@@ -8,2 +8,9 @@
+ 
++;; For the byte compiler (`make packages' counts a warning as an error): variables and
++;; functions of packages this module uses before loading them.
++(defvar emacs-cpp-root)
++(defvar which-key-idle-delay)
++(declare-function which-key--start-timer "which-key")
++(declare-function info-initialize "info")
++
+ ;; Built-in theme, carried over from the retired ~/.emacs, unless one was saved with
+diff --git a/scripts/build-packages.el b/scripts/build-packages.el
+index 818a535..238cc8f 100644
+--- a/scripts/build-packages.el
++++ b/scripts/build-packages.el
+@@ -32,2 +32,8 @@
+ ;; applied (a second `make packages') are taken out and applied again.
++;;
++;; The configuration's own modules in lisp/ are byte-compiled after lib/, with init.el's
++;; prelude in force (the generated load path and autoloads, use-package's settings, the
++;; platform defaults) and every warning counted as an error: a free variable or an
++;; unknown function in own code is a defect, not noise.  `require' then loads the .elc,
++;; and native compilation picks them up at startup as it does the packages'.
+ 
+@@ -388,4 +394,62 @@
+ 
++;;;; The configuration's own modules
++
++(defconst build-packages-lisp-dir "lisp"
++  "The directory of the configuration's own modules, relative to the root.")
++
++(defun build-packages-lisp-files (root)
++  "Return the absolute .el files of lisp/ under ROOT, in `directory-files' order."
++  (directory-files (expand-file-name build-packages-lisp-dir root) t "\\.el\\'"))
++
++(defun build-packages-init-form (root name)
++  "Return the top-level form of init.el under ROOT that starts with (defun NAME."
++  (with-temp-buffer
++    (insert-file-contents (expand-file-name "init.el" root))
++    (goto-char (point-min))
++    (unless (re-search-forward (concat "^(defun " (regexp-quote name) " ") nil t)
++      (error "build-packages: no (defun %s ...) in init.el" name))
++    (goto-char (match-beginning 0))
++    (read (current-buffer))))
++
++(defun build-packages-lisp-prelude (root)
++  "Put init.el's part before its first module in force, for compiling lisp/.
++The root, the generated load path and autoloads, use-package's settings and the
++platform defaults, as init.el sets them; `emacs-cpp-defaults-feature' is read from
++init.el, so the platform mapping has one source (D-055)."
++  (defvar emacs-cpp-root)
++  (defvar use-package-always-defer)
++  (defvar use-package-expand-minimally)
++  (setq emacs-cpp-root (file-name-as-directory root))
++  (load (expand-file-name "lib/load-path.el" root) nil t)
++  (load (expand-file-name "lib/autoloads.el" root) nil t)
++  (add-to-list 'load-path (expand-file-name build-packages-lisp-dir root))
++  (require 'use-package)
++  (setq use-package-always-defer t
++        use-package-expand-minimally t)
++  (eval (build-packages-init-form root "emacs-cpp-defaults-feature") t)
++  (require (funcall 'emacs-cpp-defaults-feature system-type)))
++
++(defun build-packages-compile-lisp (root)
++  "Byte-compile every file of lisp/ under ROOT, a warning counting as an error.
++Old .elc files are deleted first.  Signal an error naming every file that failed;
++the compiler's messages above it say why."
++  (let ((files (build-packages-lisp-files root))
++        (byte-compile-warnings t)
++        (byte-compile-error-on-warn t)
++        failed)
++    (dolist (file files)
++      (let ((elc (concat file "c")))
++        (when (file-exists-p elc)
++          (delete-file elc))))
++    (build-packages-lisp-prelude root)
++    (dolist (file files)
++      (unless (byte-compile-file file)
++        (push file failed)))
++    (when failed
++      (error "build-packages: %d own file(s) failed to compile (a warning is an error):\n  %s"
++             (length failed) (string-join (nreverse failed) "\n  ")))
++    (length files)))
++
+ (defun build-packages-build (root)
+-  "Build all packages of the repository at ROOT."
++  "Build all packages of the repository at ROOT, then the own modules in lisp/."
+   (let* ((specs (build-packages-read-specs root))
+@@ -401,6 +465,7 @@
+       (build-packages-write-autoloads root specs (expand-file-name "autoloads.el" lib))
+-      (message "build-packages: %d packages, %d patches in force, %d files compiled, \
+-%d manuals"
+-               (length specs) patches count
+-               (build-packages-write-info root specs (expand-file-name "info" lib))))))
++      (let ((manuals (build-packages-write-info root specs (expand-file-name "info" lib)))
++            (own (build-packages-compile-lisp root)))
++        (message "build-packages: %d packages, %d patches in force, %d files compiled, \
++%d manuals, %d own files compiled"
++                 (length specs) patches count manuals own)))))
+ 
+diff --git a/test/init-test.el b/test/init-test.el
+index 9b6fb5f..0b69bbe 100644
+--- a/test/init-test.el
++++ b/test/init-test.el
+@@ -46,9 +46,12 @@
+ (defun init-test--stale-elc-files ()
+-  "Return built package files whose .elc is missing or older than the .el."
++  "Return built files, lib/'s and lisp/'s, whose .elc is missing or older than the .el."
+   (let (stale)
+-    (dolist (spec (build-packages-read-specs build-packages-root))
+-      (dolist (file (build-packages-files build-packages-root spec))
+-        (let ((elc (concat file "c")))
+-          (when (or (not (file-exists-p elc)) (file-newer-than-file-p file elc))
+-            (push file stale)))))
++    (dolist (file (append (apply #'append
++                                 (mapcar (lambda (spec)
++                                           (build-packages-files build-packages-root spec))
++                                         (build-packages-read-specs build-packages-root)))
++                          (build-packages-lisp-files build-packages-root)))
++      (let ((elc (concat file "c")))
++        (when (or (not (file-exists-p elc)) (file-newer-than-file-p file elc))
++          (push file stale))))
+     stale))
+@@ -56,3 +59,3 @@
+ (ert-deftest init-packages-are-built-and-fresh ()
+-  "Every package file has a current .elc (else: run `make packages')."
++  "Every package file and own module has a current .elc (else: `make packages')."
+   (should (file-exists-p (expand-file-name "lib/load-path.el" build-packages-root)))
+-- 
+2.56.0
+
